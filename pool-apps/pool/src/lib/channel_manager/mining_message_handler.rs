@@ -19,10 +19,11 @@ use stratum_apps::stratum_core::{
     parsers_sv2::{Mining, TemplateDistribution},
     template_distribution_sv2::SubmitSolution,
 };
-use tracing::{error, info};
+use stratum_apps::utils::types::ChannelId;
+use tracing::{error, info, warn};
 
 use crate::{
-    channel_manager::{ChannelManager, RouteMessageTo, FULL_EXTRANONCE_SIZE},
+    channel_manager::{min_hashrate_for_target, ChannelManager, RouteMessageTo, FULL_EXTRANONCE_SIZE},
     error::PoolError,
 };
 
@@ -219,11 +220,29 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                 messages.push((downstream_id, Mining::SetNewPrevHash(set_new_prev_hash_mining)).into());
 
+                let vardiff = {
+                    let vardiff_floor = min_hashrate_for_target(
+                        standard_channel.get_requested_max_target(),
+                        standard_channel.get_shares_per_minute(),
+                    );
+                    match vardiff_floor {
+                        Some(min_hashrate) => VardiffState::new_with_min(min_hashrate).or_else(
+                            |e| {
+                                warn!(
+                                    error = ?e,
+                                    "Failed to initialize per-channel vardiff floor; using default"
+                                );
+                                VardiffState::new()
+                            },
+                        )?,
+                        None => VardiffState::new()?,
+                    }
+                };
+
                 downstream_data.standard_channels.insert(channel_id, standard_channel);
                 if let Some(group_channel) = downstream_data.group_channels.as_mut() {
                     group_channel.add_standard_channel_id(channel_id);
                 }
-                let vardiff = VardiffState::new()?;
                 channel_manager_data.vardiff.insert((downstream_id, channel_id).into(), vardiff);
 
                 Ok(messages)
@@ -473,10 +492,27 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             );
                         }
 
+                        let vardiff = {
+                            let vardiff_floor = min_hashrate_for_target(
+                                extended_channel.get_requested_max_target(),
+                                extended_channel.get_shares_per_minute(),
+                            );
+                            match vardiff_floor {
+                                Some(min_hashrate) => VardiffState::new_with_min(min_hashrate)
+                                    .or_else(|e| {
+                                        warn!(
+                                            error = ?e,
+                                            "Failed to initialize per-channel vardiff floor; using default"
+                                        );
+                                        VardiffState::new()
+                                    })?,
+                                None => VardiffState::new()?,
+                            }
+                        };
+
                         downstream_data
                             .extended_channels
                             .insert(channel_id, extended_channel);
-                        let vardiff = VardiffState::new()?;
                         channel_manager_data
                             .vardiff
                             .insert((downstream_id, channel_id).into(), vardiff);
@@ -836,7 +872,9 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 return Err(PoolError::DownstreamNotFound(downstream_id));
             };
 
-            downstream.downstream_data.super_safe_lock(|downstream_data| {
+            let mut vardiff_floor_update: Option<(ChannelId, f32)> = None;
+
+            let result = downstream.downstream_data.super_safe_lock(|downstream_data| {
                 let mut messages = Vec::new();
                 let channel_id = msg.channel_id;
                 let new_nominal_hash_rate = msg.nominal_hash_rate;
@@ -846,7 +884,14 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     let res = standard_channel
                                     .update_channel(new_nominal_hash_rate, Some(requested_maximum_target));
                     match res {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            if let Some(min_hashrate) = min_hashrate_for_target(
+                                standard_channel.get_requested_max_target(),
+                                standard_channel.get_shares_per_minute(),
+                            ) {
+                                vardiff_floor_update = Some((channel_id, min_hashrate));
+                            }
+                        }
                         Err(e) => {
                             error!("UpdateChannelError: {:?}", e);
                             match e {
@@ -888,7 +933,14 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     let res = extended_channel
                                     .update_channel(new_nominal_hash_rate, Some(requested_maximum_target));
                     match res {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            if let Some(min_hashrate) = min_hashrate_for_target(
+                                extended_channel.get_requested_max_target(),
+                                extended_channel.get_shares_per_minute(),
+                            ) {
+                                vardiff_floor_update = Some((channel_id, min_hashrate));
+                            }
+                        }
                         Err(e) => {
                             error!("UpdateChannelError: {:?}", e);
                             match e {
@@ -939,7 +991,18 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 }
 
                 Ok(messages)
-            })
+            });
+
+            if let Some((channel_id, min_hashrate)) = vardiff_floor_update {
+                if let Some(vardiff_state) = channel_manager_data
+                    .vardiff
+                    .get_mut(&(downstream_id, channel_id).into())
+                {
+                    vardiff_state.min_allowed_hashrate = min_hashrate;
+                }
+            }
+
+            result
         })?;
 
         for message in messages {

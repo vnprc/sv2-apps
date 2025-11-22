@@ -12,12 +12,16 @@ use stratum_apps::{
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     network_helpers::noise_stream::NoiseTcpStream,
     stratum_core::{
+        binary_sv2::U256,
+        bitcoin::Target,
         channels_sv2::{
             server::{
+                error::{ExtendedChannelError, StandardChannelError},
                 extended::ExtendedChannel,
                 jobs::{extended::ExtendedJob, job_store::DefaultJobStore, standard::StandardJob},
                 standard::StandardChannel,
             },
+            target::hash_rate_from_target,
             Vardiff, VardiffState,
         },
         codec_sv2::HandshakeRole,
@@ -92,6 +96,36 @@ pub struct ChannelManager {
     share_batch_size: usize,
     shares_per_minute: SharesPerMinute,
     coinbase_reward_script: CoinbaseRewardScript,
+}
+
+/// Derives the slowest acceptable hashrate from a negotiated maximum target.
+///
+/// This value is used as the vardiff floor so that we never request a target that violates the
+/// downstream's channel constraints.
+pub(super) fn min_hashrate_for_target(
+    target: &Target,
+    shares_per_minute: SharesPerMinute,
+) -> Option<f32> {
+    if shares_per_minute <= 0.0 {
+        warn!(
+            "Skipping vardiff min-hashrate calculation because shares_per_minute={}",
+            shares_per_minute
+        );
+        return None;
+    }
+
+    let target_bytes = target.to_le_bytes();
+    let target_u256: U256<'static> = target_bytes.into();
+    match hash_rate_from_target(target_u256, shares_per_minute as f64) {
+        Ok(value) => Some(value as f32),
+        Err(e) => {
+            warn!(
+                error = ?e,
+                "Failed to derive vardiff min-hashrate from target; falling back to default"
+            );
+            None
+        }
+    }
 }
 
 impl ChannelManager {
@@ -382,6 +416,15 @@ impl ChannelManager {
         vardiff_state: &mut VardiffState,
         updates: &mut Vec<RouteMessageTo>,
     ) {
+        if let Some(min_hashrate) = min_hashrate_for_target(
+            channel_state.get_requested_max_target(),
+            channel_state.get_shares_per_minute(),
+        ) {
+            if vardiff_state.min_allowed_hashrate < min_hashrate {
+                vardiff_state.min_allowed_hashrate = min_hashrate;
+            }
+        }
+
         let (hashrate, target, shares_per_minute) = (
             channel_state.get_nominal_hashrate(),
             channel_state.get_target(),
@@ -413,6 +456,17 @@ impl ChannelManager {
                 );
                 debug!("Updated target for extended channel_id={channel_id} to {updated_target:?}",);
             }
+            Err(ExtendedChannelError::RequestedMaxTargetOutOfRange) => {
+                warn!(
+                    "Clamping vardiff for extended channel channel_id={channel_id} after max-target violation"
+                );
+                if let Some(min_hashrate) = min_hashrate_for_target(
+                    channel_state.get_requested_max_target(),
+                    channel_state.get_shares_per_minute(),
+                ) {
+                    vardiff_state.min_allowed_hashrate = min_hashrate;
+                }
+            }
             Err(e) => warn!(
                 "Failed to update extended channel channel_id={channel_id} during vardiff {e:?}"
             ),
@@ -427,6 +481,14 @@ impl ChannelManager {
         vardiff_state: &mut VardiffState,
         updates: &mut Vec<RouteMessageTo>,
     ) {
+        if let Some(min_hashrate) =
+            min_hashrate_for_target(channel.get_requested_max_target(), channel.get_shares_per_minute())
+        {
+            if vardiff_state.min_allowed_hashrate < min_hashrate {
+                vardiff_state.min_allowed_hashrate = min_hashrate;
+            }
+        }
+
         let hashrate = channel.get_nominal_hashrate();
         let target = channel.get_target();
         let shares_per_minute = channel.get_shares_per_minute();
@@ -454,6 +516,17 @@ impl ChannelManager {
                     debug!(
                         "Updated target for standard channel channel_id={channel_id} to {updated_target:?}"
                     );
+                }
+                Err(StandardChannelError::RequestedMaxTargetOutOfRange) => {
+                    warn!(
+                        "Clamping vardiff for standard channel channel_id={channel_id} after max-target violation"
+                    );
+                    if let Some(min_hashrate) = min_hashrate_for_target(
+                        channel.get_requested_max_target(),
+                        channel.get_shares_per_minute(),
+                    ) {
+                        vardiff_state.min_allowed_hashrate = min_hashrate;
+                    }
                 }
                 Err(e) => warn!(
                     "Failed to update standard channel channel_id={channel_id} during vardiff {e:?}"
@@ -527,6 +600,87 @@ impl ChannelManager {
 
         info!("Vardiff update cycle complete");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stratum_apps::stratum_core::{
+        bitcoin::Target,
+        channels_sv2::target::hash_rate_to_target,
+    };
+
+    fn target_from_hashrate(hashrate: f64, shares_per_minute: SharesPerMinute) -> Target {
+        hash_rate_to_target(hashrate, shares_per_minute as f64).unwrap()
+    }
+
+    fn build_standard_channel(
+        channel_id: ChannelId,
+        hashrate: f32,
+        shares_per_minute: SharesPerMinute,
+    ) -> StandardChannel<'static, DefaultJobStore<StandardJob<'static>>> {
+        let target = target_from_hashrate(hashrate as f64, shares_per_minute);
+        StandardChannel::new_for_pool(
+            channel_id,
+            "tester".to_string(),
+            vec![0; FULL_EXTRANONCE_SIZE],
+            target,
+            hashrate,
+            1,
+            shares_per_minute,
+            DefaultJobStore::new(),
+            "pool".to_string(),
+        )
+        .expect("standard channel should construct")
+    }
+
+    #[test]
+    fn min_hashrate_round_trip_matches_hashrate() {
+        let shares_per_minute = 20.0;
+        let hashrate = 75_000.0;
+        let target = target_from_hashrate(hashrate as f64, shares_per_minute);
+
+        let derived = min_hashrate_for_target(&target, shares_per_minute)
+            .expect("expected min hashrate for target");
+
+        assert!(
+            (derived - hashrate).abs() < 1.0,
+            "min hashrate {derived} should match original {hashrate}"
+        );
+    }
+
+    #[test]
+    fn vardiff_clamps_after_requested_max_violation() {
+        let channel_id = 7;
+        let downstream_id = 99;
+        let shares_per_minute = 5.0;
+        let nominal_hashrate = 1_000_000.0;
+
+        let mut channel = build_standard_channel(channel_id, nominal_hashrate, shares_per_minute);
+        let mut vardiff = VardiffState::new_with_min(1.0).unwrap();
+        vardiff.timestamp_of_last_update = 0;
+        vardiff.shares_since_last_update = 0;
+
+        let mut updates = Vec::new();
+        let expected_floor = min_hashrate_for_target(
+            channel.get_requested_max_target(),
+            shares_per_minute,
+        )
+        .expect("expected min hashrate from target");
+
+        ChannelManager::run_vardiff_on_standard_channel(
+            downstream_id,
+            channel_id,
+            &mut channel,
+            &mut vardiff,
+            &mut updates,
+        );
+
+        assert!(
+            vardiff.min_allowed_hashrate >= expected_floor - 1.0,
+            "Expected vardiff floor >= negotiated floor"
+        );
     }
 }
 

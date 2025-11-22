@@ -1618,6 +1618,7 @@ dependencies = [
  "clap",
  "config",
  "rand",
+ "roles_logic_sv2 5.0.0",
  "secp256k1 0.28.2",
  "serde",
  "stratum-apps",
