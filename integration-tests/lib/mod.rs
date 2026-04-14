@@ -217,6 +217,26 @@ pub fn start_jdc(
     enable_monitoring: bool,
     jdc_mode: Option<ConfigJDCMode>,
 ) -> (JobDeclaratorClient, SocketAddr, Option<SocketAddr>) {
+    start_jdc_with_network_override(
+        pool,
+        template_provider_config,
+        supported_extensions,
+        required_extensions,
+        enable_monitoring,
+        jdc_mode,
+        None,
+    )
+}
+
+pub fn start_jdc_with_network_override(
+    pool: &[(SocketAddr, SocketAddr)], // (pool_address, jds_address)
+    template_provider_config: TemplateProviderType,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+    enable_monitoring: bool,
+    jdc_mode: Option<ConfigJDCMode>,
+    network: Option<String>,
+) -> (JobDeclaratorClient, SocketAddr, Option<SocketAddr>) {
     use jd_client_sv2::config::{JobDeclaratorClientConfig, PoolConfig, ProtocolConfig, Upstream};
     let jdc_address = get_available_address();
     let max_supported_version = 2;
@@ -279,7 +299,8 @@ pub fn start_jdc(
         required_extensions,
         monitoring_address,
         monitoring_cache_refresh_secs,
-    );
+    )
+    .with_network(network);
     let ret = jd_client_sv2::JobDeclaratorClient::new(jd_client_proxy);
     let ret_clone = ret.clone();
     tokio::spawn(async move { ret_clone.start().await });

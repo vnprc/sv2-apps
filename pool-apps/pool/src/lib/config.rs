@@ -18,29 +18,11 @@ use stratum_apps::{
     config_helpers::{opt_path_from_toml, CoinbaseRewardScript},
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     stratum_core::bitcoin::{Amount, TxOut},
-    tp_type::TemplateProviderType,
+    tp_type::{TemplateProviderType, VALID_NETWORKS},
     utils::types::{SharesBatchSize, SharesPerMinute},
 };
 
 use crate::error::PoolErrorKind;
-
-/// Valid Bitcoin network names (bitcoin-cli / `getblockchaininfo` convention).
-const VALID_NETWORKS: &[&str] = &["main", "test", "testnet4", "signet", "regtest"];
-
-/// Maps a well-known sv2-tp default port to a Bitcoin network name.
-/// Port assignments from `man sv2-tp`:
-///   8442  → main, 18442 → test, 48442 → testnet4,
-///   38442 → signet, 18447 → regtest
-fn network_from_tp_port(port: u16) -> Option<&'static str> {
-    match port {
-        8442 => Some("main"),
-        18442 => Some("test"),
-        48442 => Some("testnet4"),
-        38442 => Some("signet"),
-        18447 => Some("regtest"),
-        _ => None,
-    }
-}
 
 /// Configuration for the Pool, including connection, authority, and coinbase settings.
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -236,12 +218,7 @@ impl PoolConfig {
             }
             return Some(n.clone());
         }
-        if let TemplateProviderType::Sv2Tp { address, .. } = &self.template_provider_type {
-            if let Ok(socket_addr) = address.parse::<std::net::SocketAddr>() {
-                return network_from_tp_port(socket_addr.port()).map(|s| s.to_string());
-            }
-        }
-        None
+        self.template_provider_type.infer_network().map(|s| s.to_string())
     }
 
     /// Set the Bitcoin network override (builder style).
@@ -307,21 +284,7 @@ impl ConnectionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn network_from_tp_port_known_ports() {
-        assert_eq!(network_from_tp_port(8442), Some("main"));
-        assert_eq!(network_from_tp_port(18442), Some("test"));
-        assert_eq!(network_from_tp_port(48442), Some("testnet4"));
-        assert_eq!(network_from_tp_port(38442), Some("signet"));
-        assert_eq!(network_from_tp_port(18447), Some("regtest"));
-    }
-
-    #[test]
-    fn network_from_tp_port_unknown_port() {
-        assert_eq!(network_from_tp_port(4444), None);
-        assert_eq!(network_from_tp_port(0), None);
-    }
+    use stratum_apps::tp_type::network_from_tp_port;
 
     fn sv2_tp_type(address: &str) -> TemplateProviderType {
         TemplateProviderType::Sv2Tp {
@@ -331,26 +294,14 @@ mod tests {
     }
 
     #[test]
-    fn effective_network_infers_from_tp_port() {
-        let tp_type = sv2_tp_type("127.0.0.1:18447");
-        // Build a minimal config manually using the serde path is complex; test the
-        // helper function directly.
-        assert_eq!(network_from_tp_port(18447), Some("regtest"));
-        assert_eq!(network_from_tp_port(8442), Some("main"));
-        // Confirm an unknown port yields None
-        assert_eq!(network_from_tp_port(4444), None);
-        // Confirm the address parser works as expected
-        let port = "127.0.0.1:18447"
-            .parse::<std::net::SocketAddr>()
-            .unwrap()
-            .port();
-        assert_eq!(network_from_tp_port(port), Some("regtest"));
-        drop(tp_type); // suppress unused warning
+    fn infer_network_standard_tp_ports() {
+        assert_eq!(sv2_tp_type("127.0.0.1:18447").infer_network(), Some("regtest"));
+        assert_eq!(sv2_tp_type("127.0.0.1:8442").infer_network(), Some("main"));
+        assert_eq!(sv2_tp_type("127.0.0.1:4444").infer_network(), None);
     }
 
     #[test]
     fn valid_networks_covers_known_port_outputs() {
-        // Every value network_from_tp_port can return must be in VALID_NETWORKS
         for port in [8442u16, 18442, 48442, 38442, 18447] {
             let name = network_from_tp_port(port).unwrap();
             assert!(

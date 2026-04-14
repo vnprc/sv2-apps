@@ -305,7 +305,48 @@ async fn global_info_network_from_config_override() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Translator starts cleanly when upstream_monitoring_url is unreachable.
+// 6. JDC exposes network via config override in GlobalInfo.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn global_info_network_jdc_from_config_override() {
+    start_tracing();
+    let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (_pool, pool_addr, jds_addr, _pool_monitoring) =
+        start_pool_with_jds(tp.bitcoin_core(), vec![], vec![], false).await;
+
+    let (jdc, _jdc_addr, jdc_monitoring) = start_jdc_with_network_override(
+        &[(pool_addr, jds_addr)],
+        sv2_tp_config(tp_addr),
+        vec![],
+        vec![],
+        true,
+        None,
+        Some("regtest".to_string()),
+    );
+    let jdc_mon = jdc_monitoring.expect("jdc monitoring should be enabled");
+
+    // Wait up to 30 seconds for JDC to connect and serve the monitoring endpoint.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let body = fetch_api(jdc_mon, "/api/v1/global").await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if json["network"] == "regtest" {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "jdc global info did not expose network within timeout; got: {}",
+                json
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    shutdown_all!(jdc);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Translator starts cleanly when upstream_monitoring_url is unreachable.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn global_info_network_unreachable_upstream() {
