@@ -245,3 +245,61 @@ async fn block_found_detected_in_pool_metrics() {
 
     shutdown_all!(pool, jdc, tproxy);
 }
+
+// ---------------------------------------------------------------------------
+// 5. Pool exposes network in GlobalInfo; translator propagates it by polling.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn global_info_exposes_network() {
+    start_tracing();
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (_pool, pool_addr, pool_monitoring) = start_pool_with_network_override(
+        sv2_tp_config(tp_addr),
+        vec![],
+        vec![],
+        true,
+        Some("regtest".to_string()),
+    )
+    .await;
+    let pool_mon = pool_monitoring.expect("pool monitoring should be enabled");
+
+    // Pool global endpoint must report network = "regtest"
+    let body = fetch_api(pool_mon, "/api/v1/global").await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        json["network"], "regtest",
+        "pool global info should expose network"
+    );
+
+    // Start translator with upstream_monitoring_url pointing at pool's monitoring server
+    let upstream_monitoring_url = format!("http://{}", pool_mon);
+    let (_tproxy, _tproxy_addr, tproxy_monitoring) = start_sv2_translator_with_upstream_monitoring(
+        &[pool_addr],
+        false,
+        vec![],
+        vec![],
+        None,
+        true,
+        Some(upstream_monitoring_url),
+    )
+    .await;
+    let tproxy_mon = tproxy_monitoring.expect("tproxy monitoring should be enabled");
+
+    // Translator fetches network from pool once on connect.
+    // Wait up to 10 seconds for network to propagate.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let body = fetch_api(tproxy_mon, "/api/v1/global").await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if json["network"] == "regtest" {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "tproxy global info did not propagate network within timeout; got: {}",
+                json
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}

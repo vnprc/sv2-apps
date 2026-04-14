@@ -195,6 +195,17 @@ impl TranslatorSv2 {
             .with_sv1_monitoring(sv1_server.clone()) // SV1 client connections
             .expect("Failed to add SV1 monitoring");
 
+            // Obtain a handle to update network at runtime (before run() consumes the server)
+            let network_handle = monitoring_server.network_handle();
+
+            // Fetch network from pool's /api/v1/global once per connection
+            if let Some(pool_mon_url) = self.config.upstream_monitoring_url() {
+                let handle = network_handle.clone();
+                task_manager.spawn(async move {
+                    fetch_network_from_pool(pool_mon_url, handle).await;
+                });
+            }
+
             // Create shutdown signal using cancellation token
             let cancellation_token_clone = cancellation_token.clone();
             let fallback_coordinator_token = fallback_coordinator.token();
@@ -338,6 +349,15 @@ impl TranslatorSv2 {
                                     .expect("Failed to initialize monitoring server")
                                     .with_sv1_monitoring(sv1_server.clone())
                                     .expect("Failed to add SV1 monitoring");
+
+                                    let network_handle = monitoring_server.network_handle();
+
+                                    if let Some(pool_mon_url) = self.config.upstream_monitoring_url() {
+                                        let handle = network_handle.clone();
+                                        task_manager.spawn(async move {
+                                            fetch_network_from_pool(pool_mon_url, handle).await;
+                                        });
+                                    }
 
                                     let cancellation_token_clone = cancellation_token.clone();
                                     let fallback_coordinator_token = fallback_coordinator.token();
@@ -617,5 +637,27 @@ impl Drop for TranslatorSv2 {
     fn drop(&mut self) {
         info!("TranslatorSv2 dropped");
         self.cancellation_token.cancel();
+    }
+}
+
+/// Fetch the pool's `/api/v1/global` endpoint once and write the reported `network`
+/// value into `network_handle`. Called once per upstream connection; retries are handled
+/// by the translator's existing reconnect logic.
+#[cfg(feature = "monitoring")]
+async fn fetch_network_from_pool(
+    pool_mon_url: String,
+    network_handle: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+) {
+    let base = pool_mon_url.trim_end_matches('/');
+    let url = format!("{}/api/v1/global", base);
+    match reqwest::get(&url).await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(json) => {
+                let network = json["network"].as_str().map(|s| s.to_string());
+                *network_handle.write().unwrap() = network;
+            }
+            Err(e) => warn!("Failed to parse pool global info: {}", e),
+        },
+        Err(e) => warn!("Failed to fetch pool global info from {}: {}", url, e),
     }
 }

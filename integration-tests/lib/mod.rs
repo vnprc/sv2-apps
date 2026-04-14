@@ -122,6 +122,23 @@ pub async fn start_pool(
     required_extensions: Vec<u16>,
     enable_monitoring: bool,
 ) -> (PoolSv2, SocketAddr, Option<SocketAddr>) {
+    start_pool_with_network_override(
+        template_provider_config,
+        supported_extensions,
+        required_extensions,
+        enable_monitoring,
+        None,
+    )
+    .await
+}
+
+pub async fn start_pool_with_network_override(
+    template_provider_config: TemplateProviderType,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+    enable_monitoring: bool,
+    network: Option<String>,
+) -> (PoolSv2, SocketAddr, Option<SocketAddr>) {
     use pool_sv2::config::PoolConfig;
     let listening_address = get_available_address();
     let authority_public_key = Secp256k1PublicKey::try_from(
@@ -163,7 +180,8 @@ pub async fn start_pool(
         monitoring_address,
         monitoring_cache_refresh_secs,
         None, // no JDS
-    );
+    )
+    .with_network(network);
     let pool = PoolSv2::new(config);
     let pool_clone = pool.clone();
     tokio::spawn(async move {
@@ -339,6 +357,27 @@ pub async fn start_sv2_translator(
     job_keepalive_interval_secs: Option<u16>,
     enable_monitoring: bool,
 ) -> (TranslatorSv2, SocketAddr, Option<SocketAddr>) {
+    start_sv2_translator_with_upstream_monitoring(
+        upstreams,
+        aggregate_channels,
+        supported_extensions,
+        required_extensions,
+        job_keepalive_interval_secs,
+        enable_monitoring,
+        None,
+    )
+    .await
+}
+
+pub async fn start_sv2_translator_with_upstream_monitoring(
+    upstreams: &[SocketAddr],
+    aggregate_channels: bool,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+    job_keepalive_interval_secs: Option<u16>,
+    enable_monitoring: bool,
+    upstream_monitoring_url: Option<String>,
+) -> (TranslatorSv2, SocketAddr, Option<SocketAddr>) {
     let job_keepalive_interval_secs = job_keepalive_interval_secs.unwrap_or(60);
     let upstreams = upstreams
         .iter()
@@ -395,7 +434,8 @@ pub async fn start_sv2_translator(
         required_extensions,
         monitoring_address,
         monitoring_cache_refresh_secs,
-    );
+    )
+    .with_upstream_monitoring_url(upstream_monitoring_url);
     let translator_v2 = translator_sv2::TranslatorSv2::new(config);
     let clone_translator_v2 = translator_v2.clone();
     tokio::spawn(async move {
