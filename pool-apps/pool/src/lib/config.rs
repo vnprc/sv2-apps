@@ -24,14 +24,17 @@ use stratum_apps::{
 
 use crate::error::PoolErrorKind;
 
+/// Valid Bitcoin network names (bitcoin-cli / `getblockchaininfo` convention).
+const VALID_NETWORKS: &[&str] = &["main", "test", "testnet4", "signet", "regtest"];
+
 /// Maps a well-known sv2-tp default port to a Bitcoin network name.
 /// Port assignments from `man sv2-tp`:
-///   8442  → mainnet, 18442 → testnet3, 48442 → testnet4,
-///   38442 → signet,  18447 → regtest
+///   8442  → main, 18442 → test, 48442 → testnet4,
+///   38442 → signet, 18447 → regtest
 fn network_from_tp_port(port: u16) -> Option<&'static str> {
     match port {
-        8442 => Some("mainnet"),
-        18442 => Some("testnet3"),
+        8442 => Some("main"),
+        18442 => Some("test"),
         48442 => Some("testnet4"),
         38442 => Some("signet"),
         18447 => Some("regtest"),
@@ -68,7 +71,7 @@ pub struct PoolConfig {
     /// Optional override for the Bitcoin network name exposed via `GET /api/v1/global`.
     /// When absent the network is inferred from the sv2-tp port in `template_provider_type`
     /// using well-known default ports (see `network_from_tp_port`).
-    /// Values follow bitcoin-cli convention: `"mainnet"`, `"testnet3"`, `"testnet4"`,
+    /// Values follow bitcoin-cli convention: `"main"`, `"test"`, `"testnet4"`,
     /// `"signet"`, `"regtest"`.
     #[serde(default)]
     network: Option<String>,
@@ -216,9 +219,22 @@ impl PoolConfig {
 
     /// Returns the effective Bitcoin network name: the explicit `network` override if set,
     /// otherwise inferred from the sv2-tp port in `template_provider_type`.
+    ///
+    /// Returns `None` if the explicit override is not one of the known values
+    /// (`"main"`, `"test"`, `"testnet4"`, `"signet"`, `"regtest"`) or if the tp_address
+    /// port is not a well-known sv2-tp default port.
     pub fn effective_network(&self) -> Option<String> {
-        if self.network.is_some() {
-            return self.network.clone();
+        if let Some(ref n) = self.network {
+            if !VALID_NETWORKS.contains(&n.as_str()) {
+                tracing::warn!(
+                    "pool config: network {:?} is not a recognised value \
+                     (expected one of {:?}); network will not be reported.",
+                    n,
+                    VALID_NETWORKS
+                );
+                return None;
+            }
+            return Some(n.clone());
         }
         if let TemplateProviderType::Sv2Tp { address, .. } = &self.template_provider_type {
             if let Ok(socket_addr) = address.parse::<std::net::SocketAddr>() {
@@ -294,8 +310,8 @@ mod tests {
 
     #[test]
     fn network_from_tp_port_known_ports() {
-        assert_eq!(network_from_tp_port(8442), Some("mainnet"));
-        assert_eq!(network_from_tp_port(18442), Some("testnet3"));
+        assert_eq!(network_from_tp_port(8442), Some("main"));
+        assert_eq!(network_from_tp_port(18442), Some("test"));
         assert_eq!(network_from_tp_port(48442), Some("testnet4"));
         assert_eq!(network_from_tp_port(38442), Some("signet"));
         assert_eq!(network_from_tp_port(18447), Some("regtest"));
@@ -319,14 +335,8 @@ mod tests {
         let tp_type = sv2_tp_type("127.0.0.1:18447");
         // Build a minimal config manually using the serde path is complex; test the
         // helper function directly.
-        assert_eq!(
-            network_from_tp_port(18447),
-            Some("regtest"),
-        );
-        assert_eq!(
-            network_from_tp_port(8442),
-            Some("mainnet"),
-        );
+        assert_eq!(network_from_tp_port(18447), Some("regtest"));
+        assert_eq!(network_from_tp_port(8442), Some("main"));
         // Confirm an unknown port yields None
         assert_eq!(network_from_tp_port(4444), None);
         // Confirm the address parser works as expected
@@ -336,5 +346,17 @@ mod tests {
             .port();
         assert_eq!(network_from_tp_port(port), Some("regtest"));
         drop(tp_type); // suppress unused warning
+    }
+
+    #[test]
+    fn valid_networks_covers_known_port_outputs() {
+        // Every value network_from_tp_port can return must be in VALID_NETWORKS
+        for port in [8442u16, 18442, 48442, 38442, 18447] {
+            let name = network_from_tp_port(port).unwrap();
+            assert!(
+                VALID_NETWORKS.contains(&name),
+                "port {port} maps to {name:?} which is not in VALID_NETWORKS"
+            );
+        }
     }
 }
